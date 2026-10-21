@@ -1,0 +1,85 @@
+800|    pub position_id: String,
+801|    pub message: String,
+802|}
+803|
+804|/// [`check_external_closes`] 的结论。
+805|#[derive(Debug, Default)]
+806|pub struct ExternalCloseCheck {
+807|    /// 剩下的腿都已在交易所归零、且连续两次对账都如此：可以在台账里结束这笔仓位。
+808|    pub adopt: Vec<String>,
+809|    /// 只对上一部分（一条腿被外部平掉、数量对不上），或还在等第二次确认：只说明，不处理。
+810|    pub notes: Vec<ExternalNote>,
+811|}
+812|
+813|/// 判断哪些仓位是在交易所被外部（手动）平掉的。**纯判断，不下单、不改台账。**
+814|///
+815|/// 只在下面全部成立时才建议结束一笔仓位：
+816|/// - 状态是 `Open`（两腿俱在）或 `Closing`；
+817|/// - 它剩下的**每一条腿**在对应场所都是「台账有仓、场所净数量为 0」；
+818|/// - 这些场所没有 `Unverified`（查询失败不是零）、也没有挂单方面的不一致（游离的挂单还可能成交）；
+819|/// - 上一次对账（至少 [`EXTERNAL_CLOSE_CONFIRM`] 之前）也是这样。
+820|///
+821|/// 一条腿没了、另一条还在，是裸敞口：**不**自动平剩下那条，只提示。
+822|/// `seen` 记着每笔候选第一次被发现的时刻；不再是候选的会被清掉。
+823|pub fn check_external_closes(
+824|    reconciliation: &Reconciliation,
+825|    exposed: &[&PairPosition],
+826|    seen: &mut HashMap<String, std::time::Instant>,
+827|    now: std::time::Instant,
+828|) -> ExternalCloseCheck {
+829|    use crate::reconcile::DivergenceKind as Kind;
+830|    let mut check = ExternalCloseCheck::default();
+831|    let mut candidates = BTreeSet::new();
+832|    for position in exposed {
+833|        if !matches!(
+834|            position.status,
+835|            PositionStatus::Open | PositionStatus::Closing
+836|        ) {
+837|            continue;
+838|        }
+839|        let legs: Vec<&crate::LegFill> = [position.long.as_ref(), position.short.as_ref()]
+840|            .into_iter()
+841|            .flatten()
+842|            .collect();
+843|        if legs.is_empty() || (position.status == PositionStatus::Open && legs.len() < 2) {
+844|            continue;
+845|        }
+846|        let symbol = position.symbol.to_string();
+847|        // 场所层面的不一致（不看是哪个合约）：查询没核对、挂单对不上、还有台账之外的持仓
+848|        // （可能是这笔仓位换了个币名还在那儿）—— 都不能当成「这笔平掉了」。
+849|        let on = |kind: Kind, leg: &crate::LegFill| {
+850|            reconciliation
+851|                .divergences
+852|                .iter()
+853|                .any(|d| d.kind == kind && d.venue == Some(leg.venue))
+854|        };
+855|        let missing: Vec<&crate::LegFill> = legs
+856|            .iter()
+857|            .copied()
+858|            .filter(|leg| {
+859|                reconciliation.divergences.iter().any(|d| {
+860|                    d.kind == Kind::PositionMissingOnVenue
+861|                        && d.venue == Some(leg.venue)
+862|                        && d.reference == symbol
+863|                })
+864|            })
+865|            .collect();
+866|        let mismatched: Vec<&crate::LegFill> = legs
+867|            .iter()
+868|            .copied()
+869|            .filter(|leg| {
+870|                reconciliation.divergences.iter().any(|d| {
+871|                    d.kind == Kind::PositionMismatch
+872|                        && d.venue == Some(leg.venue)
+873|                        && d.reference == symbol
+874|                })
+875|            })
+876|            .collect();
+877|        let note = |message: String| ExternalNote {
+878|            position_id: position.id.clone(),
+879|            message,
+880|        };
+881|        if missing.is_empty() && mismatched.is_empty() {
+882|            continue;
+883|        }
+884|        if missing.len() < legs.len() {

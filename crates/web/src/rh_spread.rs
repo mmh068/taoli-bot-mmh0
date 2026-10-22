@@ -11,6 +11,7 @@
 //! 3. 每分钟落盘一行中间价基差（每组一个文件前缀），按合约、按时段（盘中 / 盘后 / 周末 / 加密币全天）
 //!    统计「正常水平」。股票类合约在休市时常常有**系统性**偏差：现价差大不等于会收敛到 0；
 //! 4. 偏离正常水平、且「回到正常水平」的预估净收益超过门槛时推送 Telegram（同一组同一合约同一方向 30 分钟一条）。
+//!    实盘台账里已经有敞口的币不推：已经在仓里，不必再喊去开。
 //!
 //! 基差一律是 **(a − b) / 均值**，方向叫 `long_a` / `long_b`（最早那组 a = Arcus、b = Lighter RH，与旧历史同号）。
 
@@ -24,7 +25,7 @@ mod session;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -429,13 +430,50 @@ pub struct Monitor {
     alerts: Arc<Alerter>,
     /// 最近一分钟发出的价差提醒时刻（[`ALERTS_PER_MINUTE`]）。
     sent: std::sync::Mutex<std::collections::VecDeque<Instant>>,
+    /// 实盘还敞口的合约 base。提醒跳过这些币。
+    held_bases: HeldBases,
 }
 
 /// 订阅变化：每家场所要订阅的市场名（全量）。
 type Subscriptions = HashMap<Venue, Vec<String>>;
 
+/// 当前实盘还敞口的合约 base（大写）。价差偏离提醒跳过这些币。
+#[derive(Clone, Default)]
+pub struct HeldBases {
+    inner: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+impl HeldBases {
+    /// 用这一批合约 base 替换跳过名单。空串丢掉；大小写不敏感。
+    pub fn replace(&self, bases: impl IntoIterator<Item = impl AsRef<str>>) {
+        let next = bases
+            .into_iter()
+            .map(|base| base.as_ref().trim().to_ascii_uppercase())
+            .filter(|base| !base.is_empty())
+            .collect();
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    }
+
+    pub fn contains(&self, base: &str) -> bool {
+        let base = base.trim().to_ascii_uppercase();
+        !base.is_empty()
+            && self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&base)
+    }
+}
+
 impl Monitor {
     pub fn new(config: Config, alerts: Arc<Alerter>) -> Arc<Self> {
+        Self::with_held(config, alerts, HeldBases::default())
+    }
+
+    pub fn with_held(config: Config, alerts: Arc<Alerter>, held_bases: HeldBases) -> Arc<Self> {
         let view = View {
             enabled: config.enabled,
             size_usdt: config.size_usdt,
@@ -466,6 +504,7 @@ impl Monitor {
             view: RwLock::new(view),
             alerts,
             sent: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            held_bases,
         })
     }
 
@@ -829,6 +868,10 @@ impl Monitor {
         else {
             return;
         };
+        if self.held_bases.contains(&line.base) {
+            debug!(symbol = %line.base, "价差偏离：已有持仓，不推送");
+            return;
+        }
         let Some(text) = alert_text(line, best, &self.config) else {
             return;
         };

@@ -52,6 +52,7 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::{error, info, warn};
 
 use crate::AppState;
+use crate::rh_spread::HeldBases;
 
 /// 盘口请求多少档。与命令行默认值一致。
 const DEPTH_LEVELS: u32 = 20;
@@ -237,6 +238,8 @@ pub struct LiveDesk {
     dirty_rounds: std::sync::atomic::AtomicU32,
     /// 对账不干净的告警已经发过（恢复时要发「已恢复」）。
     dirty_alerted: std::sync::atomic::AtomicBool,
+    /// 实盘敞口的合约 base，给价差偏离提醒跳过已持仓的币。
+    held_bases: HeldBases,
     /// 各条腿在交易所的实际保证金状态缓存：持仓页 30 秒刷一次，Lighter RH 这类限频紧的场所经不起
     /// 每次都查。只缓存 [`LEG_STATE_TTL`]。
     leg_state_cache: Mutex<HashMap<(Venue, String), LegStateEntry>>,
@@ -847,14 +850,15 @@ impl LiveDesk {
         if !summary.adopted.is_empty() {
             self.backfill_external_pnl().await;
         }
-        self.alert_round(&summary);
+        self.refresh_held_bases().await;
+        self.alert_round(&summary).await;
         *self.last_round.write().await = Some(summary.clone());
         summary
     }
 
     /// 这一轮里值得推到手机上的事：规则执行 / 失败、外部平仓、裸敞口、对账持续不干净。
     /// 消息只含仓位 id、合约、场所名和金额，不含地址与账户号（见 [`crate::alert`]）。
-    fn alert_round(&self, summary: &RoundSummary) {
+    async fn alert_round(&self, summary: &RoundSummary) {
         use std::sync::atomic::Ordering;
         let alerts = &self.alerts;
         for id in &summary.adopted {
@@ -939,6 +943,13 @@ impl LiveDesk {
                     ) {
                         self.dirty_alerted.store(true, Ordering::SeqCst);
                     }
+                    if rounds == DIRTY_ROUNDS_TO_ALERT {
+                        info!(rounds, "对账连续不一致，自动启动核实");
+                        let message = self.verify_pending().await;
+                        alerts.notify_always(format!(
+                            "🔍 对账连续 {rounds} 轮不一致，已自动启动核实：\n{message}"
+                        ));
+                    }
                 }
             }
             Some(true) => {
@@ -952,6 +963,92 @@ impl LiveDesk {
                     alerts.notify("round-failed", format!("⚠️ 实盘规则轮没跑成：{error}"));
                 }
             }
+        }
+    }
+}
+
+impl LiveDesk {
+    /// 把台账里还有敞口的合约 base 同步给价差监控，已持仓的币不再推偏离提醒。
+    async fn refresh_held_bases(&self) {
+        let bases = match self.ledger.replay().await {
+            Ok((replayed, _)) => replayed
+                .exposed()
+                .into_iter()
+                .map(|position| position.symbol.base.clone())
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                warn!("刷新持仓币种失败，价差偏离提醒暂不更新跳过名单：{error}");
+                return;
+            }
+        };
+        self.held_bases.replace(bases);
+    }
+
+    /// 启动核实：把台账里没有终态的订单对到交易所记录上。调用方必须已持有 `self.lock`。
+    async fn verify_pending(&self) -> String {
+        match desk::resolve_pending_orders(&self.ledger, &self.brokers).await {
+            Ok(resolution) => {
+                if !resolution.filled_unrecorded.is_empty() {
+                    self.alerts.notify_always(format!(
+                        "⚠️ 启动核实：{} 张订单在上次中断时已经成交、但台账没记（{}）。仓位记录里没有这些成交，对账会报持仓不符：请对照各场所账户人工处理。",
+                        resolution.filled_unrecorded.len(),
+                        resolution.filled_unrecorded.join("、")
+                    ));
+                }
+                let mut message = format_startup_verify(&resolution);
+                match self.reconcile_adopting_with(true).await {
+                    Ok((_, notes, adopted)) => {
+                        if !adopted.is_empty() {
+                            self.backfill_external_pnl().await;
+                            let replayed = self
+                                .ledger
+                                .replay()
+                                .await
+                                .ok()
+                                .map(|(replayed, _)| replayed);
+                            let mut lines = Vec::new();
+                            if message.starts_with("✅") {
+                                lines.push("🔍 启动核实结果".into());
+                                lines.push("没有需要处理的未完成订单。".into());
+                            } else {
+                                lines.push(message);
+                            }
+                            for id in &adopted {
+                                let detail = replayed.as_ref().and_then(|replayed| {
+                                    replayed.positions.get(id).map(|position| {
+                                        let pnl = position
+                                            .note
+                                            .as_deref()
+                                            .unwrap_or("已按人工外部处理结束");
+                                        format!("{id} {}：{pnl}", position.symbol)
+                                    })
+                                });
+                                lines.push(format!(
+                                    "人工外部处理：{}",
+                                    detail.unwrap_or_else(|| format!("{id} 已结束"))
+                                ));
+                            }
+                            for note in notes {
+                                lines.push(format!("[{}] {}", note.position_id, note.message));
+                            }
+                            message = lines.join("\n");
+                        } else if !notes.is_empty() {
+                            let extra = notes
+                                .iter()
+                                .map(|note| format!("[{}] {}", note.position_id, note.message))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            message = format!("{message}\n{extra}");
+                        }
+                    }
+                    Err(error) => {
+                        message = format!("{message}\n对账结束开仓中断仓位失败：{error:#}");
+                    }
+                }
+                self.refresh_held_bases().await;
+                message
+            }
+            Err(error) => format!("启动核实失败：{error:#}"),
         }
     }
 }
@@ -979,6 +1076,8 @@ pub struct Trade {
     live_wanted: Option<LiveMode>,
     /// 实盘还没连上时最近一次失败的原因（给页面、/healthz、Telegram）。
     live_pending: Arc<std::sync::Mutex<Option<LivePending>>>,
+    /// 实盘敞口的合约 base，与价差监控共用：已持仓的币不推价差偏离。
+    held_bases: HeldBases,
 }
 
 /// 实盘还没连上：从什么时候开始、试了几次、最近一次为什么失败。
@@ -1033,6 +1132,7 @@ impl Trade {
             live_slot: Arc::new(std::sync::OnceLock::new()),
             live_wanted: (mode != LiveMode::Off).then_some(mode),
             live_pending: Arc::new(std::sync::Mutex::new(None)),
+            held_bases: HeldBases::default(),
         };
         if mode == LiveMode::Off {
             return Ok(trade);
@@ -1046,7 +1146,7 @@ impl Trade {
         // 配置错误（滑点、场所名、凭据格式、台账打不开）仍然立刻报错退出：那不会自己好。
         // 只有交易所连不上 / 限频 / 维护这类**暂时的**失败，才让看板先起来、后台重连。
         let plan = LivePlan::from_env(settings, mode)?;
-        match connect_live(&plan, client, Arc::clone(alerts)).await {
+        match connect_live(&plan, client, Arc::clone(alerts), trade.held_bases.clone()).await {
             Ok(desk) => {
                 let _ = trade.live_slot.set(Arc::new(desk));
             }
@@ -1081,6 +1181,11 @@ impl Trade {
         self.live_slot.get()
     }
 
+    /// 实盘敞口的合约 base，给价差监控跳过已持仓的币。
+    pub(crate) fn held_bases(&self) -> HeldBases {
+        self.held_bases.clone()
+    }
+
     /// 实盘开着但还没连上：原因。
     pub(crate) fn live_pending(&self) -> Option<LivePending> {
         if self.live_slot.get().is_some() {
@@ -1096,13 +1201,14 @@ impl Trade {
     fn spawn_live_reconnect(&self, plan: LivePlan, client: reqwest::Client, alerts: Arc<Alerter>) {
         let slot = Arc::clone(&self.live_slot);
         let pending = Arc::clone(&self.live_pending);
+        let held = self.held_bases.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(LIVE_RETRY).await;
                 if crate::shutdown::is_draining() {
                     return;
                 }
-                match connect_live(&plan, &client, Arc::clone(&alerts)).await {
+                match connect_live(&plan, &client, Arc::clone(&alerts), held.clone()).await {
                     Ok(desk) => {
                         let desk = Arc::new(desk);
                         if slot.set(Arc::clone(&desk)).is_err() {
@@ -1353,69 +1459,7 @@ impl Trade {
         let Ok(_guard) = live.lock.try_lock() else {
             return "实盘正忙（下单 / 平仓 / 规则轮），稍后再试。".into();
         };
-        match desk::resolve_pending_orders(&live.ledger, &live.brokers).await {
-            Ok(resolution) => {
-                if !resolution.filled_unrecorded.is_empty() {
-                    live.alerts.notify_always(format!(
-                        "⚠️ 启动核实：{} 张订单在上次中断时已经成交、但台账没记（{}）。                         仓位记录里没有这些成交，对账会报持仓不符：请对照各场所账户人工处理。",
-                        resolution.filled_unrecorded.len(),
-                        resolution.filled_unrecorded.join("、")
-                    ));
-                }
-                let mut message = format_startup_verify(&resolution);
-                match live.reconcile_adopting_with(true).await {
-                    Ok((_, notes, adopted)) => {
-                        if !adopted.is_empty() {
-                            live.backfill_external_pnl().await;
-                            let replayed = live
-                                .ledger
-                                .replay()
-                                .await
-                                .ok()
-                                .map(|(replayed, _)| replayed);
-                            let mut lines = Vec::new();
-                            if message.starts_with("✅") {
-                                lines.push("🔍 启动核实结果".into());
-                                lines.push("没有需要处理的未完成订单。".into());
-                            } else {
-                                lines.push(message);
-                            }
-                            for id in &adopted {
-                                let detail = replayed.as_ref().and_then(|replayed| {
-                                    replayed.positions.get(id).map(|position| {
-                                        let pnl = position
-                                            .note
-                                            .as_deref()
-                                            .unwrap_or("已按人工外部处理结束");
-                                        format!("{id} {}：{pnl}", position.symbol)
-                                    })
-                                });
-                                lines.push(format!(
-                                    "人工外部处理：{}",
-                                    detail.unwrap_or_else(|| format!("{id} 已结束"))
-                                ));
-                            }
-                            for note in notes {
-                                lines.push(format!("[{}] {}", note.position_id, note.message));
-                            }
-                            message = lines.join("\n");
-                        } else if !notes.is_empty() {
-                            let extra = notes
-                                .iter()
-                                .map(|note| format!("[{}] {}", note.position_id, note.message))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            message = format!("{message}\n{extra}");
-                        }
-                    }
-                    Err(error) => {
-                        message = format!("{message}\n对账结束开仓中断仓位失败：{error:#}");
-                    }
-                }
-                message
-            }
-            Err(error) => format!("启动核实失败：{error:#}"),
-        }
+        live.verify_pending().await
     }
 
     /// 暂停 / 恢复开新仓。实盘没开时返回 `false`。
@@ -1692,6 +1736,7 @@ async fn connect_live(
     plan: &LivePlan,
     client: &reqwest::Client,
     alerts: Arc<Alerter>,
+    held_bases: HeldBases,
 ) -> Result<LiveDesk> {
     let LivePlan {
         mode,
@@ -1750,7 +1795,7 @@ async fn connect_live(
     if mode == LiveMode::Trade && watch_sec == 0 {
         warn!("ARB_WEB_LIVE_WATCH_SEC=0：实盘持仓规则不会自动执行，只能在页面上手动跑");
     }
-    Ok(LiveDesk {
+    let desk = LiveDesk {
         mode,
         by_venue: crate::api_map(&apis),
         apis,
@@ -1775,8 +1820,11 @@ async fn connect_live(
         exit_retries: desk::ExitRetries::default(),
         dirty_rounds: std::sync::atomic::AtomicU32::new(0),
         dirty_alerted: std::sync::atomic::AtomicBool::new(false),
+        held_bases,
         watch_sec,
-    })
+    };
+    desk.refresh_held_bases().await;
+    Ok(desk)
 }
 
 fn format_startup_verify(resolution: &desk::PendingResolution) -> String {
@@ -2820,6 +2868,7 @@ async fn open_live(live: &LiveDesk, request: &OpenRequest, execute: bool) -> Res
     if failed_open {
         live.check_breaker().await;
     }
+    live.refresh_held_bases().await;
     match outcome {
         Ok(position) => Json(json!({
             "mode": "live",
@@ -2923,6 +2972,7 @@ async fn run_close(state: &AppState, body: &CloseBody) -> Response {
             warn!(position = %position_id, "看板实盘平仓");
             let result = desk::close(&live.executor(), &live.ledger, position_id).await;
             let after = live.reconcile().await.map_err(|error| format!("{error:#}"));
+            live.refresh_held_bases().await;
             match &result {
                 Ok((position, None)) => live.alerts.notify_always(format!(
                     "📉 实盘平仓：{} {} → {:?}。{}",
@@ -3180,6 +3230,7 @@ mod tests {
                 attempts: 3,
                 error: "连接 lighter-rh 账户失败：HTTP 404；地址 0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
             }))),
+            held_bases: HeldBases::default(),
         };
         // 实盘请求：503（暂时的），不是 400「没开实盘」。
         let Err(denied) = trade.live() else {
@@ -3518,6 +3569,7 @@ mod tests {
             pause_state: std::sync::Mutex::new(PauseState::default()),
             dirty_rounds: std::sync::atomic::AtomicU32::new(0),
             dirty_alerted: std::sync::atomic::AtomicBool::new(false),
+            held_bases: HeldBases::default(),
             leg_state_cache: Mutex::new(HashMap::new()),
             external_seen: std::sync::Mutex::new(HashMap::new()),
             funding_cache: Mutex::new(HashMap::new()),

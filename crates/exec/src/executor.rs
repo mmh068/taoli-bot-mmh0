@@ -911,6 +911,11 @@ impl Executor {
         self.persist_order(&OrderState::new(order.clone())).await?;
         let broker = self.broker(order.venue)?;
         let placed = broker.place(order).await;
+        if let Ok(ack) = &placed {
+            let mut recorded = OrderState::new(order.clone());
+            recorded.venue_order_id = Some(ack.venue_order_id.clone());
+            self.persist_order(&recorded).await?;
+        }
         let (found, last_lookup_error) = confirm_order_state(broker.as_ref(), order).await;
         let mut state = match (found, placed, last_lookup_error) {
             (Some(state), _, _) => state,

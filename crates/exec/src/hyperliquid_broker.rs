@@ -20,6 +20,14 @@
 //! estimates. Incomplete/expired fill history fails closed. USDC fees follow the existing
 //! quanto accounting convention; HYPE/PURR retain their USDC symbol quote.
 //!
+//! `orderStatus` is not a durable archive: IOC orders (especially on HIP-3 `io`) can
+//! return `unknownOid` after they fill or cancel. The venue order id from the exchange
+//! ack is persisted on the reservation immediately. Lookup then tries `orderStatus` by
+//! cloid, then by oid, then `historicalOrders`, then `userFillsByTime` for that oid.
+//! Quantities must match the reserved size; a zero position is never treated as a fill.
+//! If none of those sources confirm the result, the reserved id stays query-only and is
+//! never resubmitted.
+//!
 //! # HIP-3 dexes
 //!
 //! HIP-3 markets share the same `/info` and `/exchange` endpoints and, for one account,
@@ -209,6 +217,9 @@ struct Reservation {
     cloid: String,
     order: NewOrder,
     effective_quantity: Decimal,
+    /// Exchange oid from the place ack. Written as soon as the venue returns it.
+    #[serde(default)]
+    oid: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -344,7 +355,7 @@ struct RemoteOrder {
     cloid: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RemoteStatus {
     order: RemoteOrder,
@@ -576,6 +587,13 @@ impl HyperliquidBroker {
         Ok(journal.by_cloid.get(cloid).cloned())
     }
 
+    fn remember_oid(&self, cloid: &str, oid: u64) -> ArbResult<()> {
+        self.journal
+            .lock()
+            .map_err(|_| error("intent journal lock poisoned"))?
+            .remember_oid(cloid, oid)
+    }
+
     /// 授权 + 取进程内单调 nonce + 签名，返回可以直接 POST 到 `/exchange` 的请求体。
     /// 只做本地计算、不发请求；只读模式在这里就返回 `Err`，所以任何写操作都签不出东西。
     fn signed_request<T: Serialize>(&self, action: &T) -> ArbResult<Value> {
@@ -733,6 +751,117 @@ impl HyperliquidBroker {
             .map(Some),
             _ => Err(error("unknown order-status response")),
         }
+    }
+
+    async fn lookup_remote(&self, cloid: &str, oid: Option<u64>) -> ArbResult<Option<RemoteStatus>> {
+        if let Some(remote) = self.remote_status(json!(cloid)).await? {
+            return Ok(Some(remote));
+        }
+        if let Some(oid) = oid
+            && let Some(remote) = self.remote_status(json!(oid)).await?
+        {
+            return Ok(Some(remote));
+        }
+        self.historical_status(oid, cloid).await
+    }
+
+    async fn historical_status(
+        &self,
+        oid: Option<u64>,
+        cloid: &str,
+    ) -> ArbResult<Option<RemoteStatus>> {
+        let rows: Vec<RemoteStatus> = post(
+            &self.client,
+            INFO_URL,
+            &json!({"type":"historicalOrders", "user":self.account}),
+        )
+        .await?;
+        Ok(match_historical_order(&rows, oid, cloid).cloned())
+    }
+
+    async fn fills_for_oid(&self, oid: u64, start: u64, end: u64) -> ArbResult<Vec<RemoteFill>> {
+        if end < start {
+            return Err(error("invalid order time interval"));
+        }
+        let stub = RemoteOrder {
+            coin: String::new(),
+            side: String::new(),
+            limit_px: "1".into(),
+            sz: "0".into(),
+            orig_sz: "1".into(),
+            oid,
+            timestamp: start,
+            reduce_only: false,
+            cloid: None,
+        };
+        let fills = self.order_fills(&stub, end).await?;
+        Ok(fills)
+    }
+
+    async fn state_from_oid_fills(
+        &self,
+        saved: &Reservation,
+        oid: u64,
+    ) -> ArbResult<Option<OrderState>> {
+        let end = now_ms()?;
+        let start = end.saturating_sub(86_400_000);
+        let fills = self.fills_for_oid(oid, start, end).await?;
+        if fills.is_empty() {
+            // No fills is not proof the order never filled, and not proof it cancelled.
+            return Ok(None);
+        }
+        let coin = fills[0].coin.clone();
+        let side = fills[0].side.clone();
+        if fills
+            .iter()
+            .any(|fill| fill.coin != coin || fill.side != side)
+        {
+            return Err(error("fills for oid mix coins or sides"));
+        }
+        if symbol_of(self.dex, &coin)? != saved.order.symbol {
+            return Err(error("oid fills do not match reserved symbol"));
+        }
+        if parse_side(&side)? != saved.order.side {
+            return Err(error("oid fills do not match reserved side"));
+        }
+        let timestamp = fills.iter().map(|fill| fill.time).min().unwrap_or(start);
+        let original = saved.effective_quantity;
+        let stub = RemoteOrder {
+            coin,
+            side,
+            limit_px: saved
+                .order
+                .limit_price
+                .map(|price| price.normalize().to_string())
+                .unwrap_or_else(|| "1".into()),
+            sz: "0".into(),
+            orig_sz: original.normalize().to_string(),
+            oid,
+            timestamp,
+            reduce_only: saved.order.reduce_only,
+            cloid: Some(saved.cloid.clone()),
+        };
+        let (quantity, notional, fees) = aggregate_fills(&fills, &stub)?;
+        if quantity > original {
+            return Err(error("oid fills exceed reserved quantity"));
+        }
+        let remaining = original - quantity;
+        let status = if remaining.is_zero() {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Cancelled
+        };
+        let mut state = OrderState::new(saved.order.clone());
+        state.venue_order_id = Some(oid.to_string());
+        state.status = status;
+        state.filled_usdt = notional;
+        state.average_price = if quantity > Decimal::ZERO {
+            Some(divide(notional, quantity)?)
+        } else {
+            None
+        };
+        state.fee_usdt = fees;
+        Ok(Some(state))
     }
 
     async fn state_from_remote(
@@ -1024,6 +1153,7 @@ impl Broker for HyperliquidBroker {
                 cloid: cloid.clone(),
                 order: order.clone(),
                 effective_quantity: quantity,
+                oid: None,
             })?;
         if let Some(leverage) = leverage {
             self.configure_margin(asset_id, &asset, leverage, order.margin_mode)
@@ -1061,37 +1191,60 @@ impl Broker for HyperliquidBroker {
         if statuses[0].get("error").is_some() {
             return Err(error("order rejected by venue; reserved ID retained"));
         }
-        // Ack only proves acceptance; require actual status + complete fills including fees.
-        let remote = self
-            .remote_status(json!(cloid))
-            .await?
-            .ok_or_else(|| error("accepted order not yet queryable; reserved ID retained"))?;
-        let state = self
-            .state_from_remote(remote, Some(&order.client_order_id))
-            .await?;
-        ack(&state)
+        let oid = ack_oid(&statuses[0]);
+        if let Some(oid) = oid {
+            self.remember_oid(&cloid, oid)?;
+        }
+        // Ack only proves acceptance. Resolve via orderStatus, historicalOrders, then fills.
+        // A flat position is never treated as proof this order filled.
+        let remote = self.lookup_remote(&cloid, oid).await?;
+        if let Some(remote) = remote {
+            let state = self
+                .state_from_remote(remote, Some(&order.client_order_id))
+                .await?;
+            return ack(&state);
+        }
+        if let Some(oid) = oid {
+            let saved = self
+                .reservation(&cloid)?
+                .ok_or_else(|| error("reserved ID missing after ack"))?;
+            if let Some(state) = self.state_from_oid_fills(&saved, oid).await? {
+                return ack(&state);
+            }
+        }
+        return Err(error(
+            "accepted order not yet queryable; reserved ID retained",
+        ));
     }
 
     async fn order_state(&self, client_order_id: &ClientOrderId) -> ArbResult<Option<OrderState>> {
         let external_prefix = format!("{}:oid:", self.dex.venue().as_str());
+        let cloid = client_cloid(client_order_id);
+        let saved = self.reservation(&cloid)?;
         let oid = match client_order_id.0.strip_prefix(&external_prefix) {
-            Some(raw) => json!(
+            Some(raw) => Some(
                 raw.parse::<u64>()
-                    .map_err(|_| error("invalid external order ID"))?
+                    .map_err(|_| error("invalid external order ID"))?,
             ),
-            None => json!(client_cloid(client_order_id)),
+            None => saved.as_ref().and_then(|saved| saved.oid),
         };
-        let Some(remote) = self.remote_status(oid).await? else {
-            if self.reservation(&client_cloid(client_order_id))?.is_some() {
-                return Err(error(
-                    "reserved order no longer queryable; cannot assume it never filled",
-                ));
+        if let Some(remote) = self.lookup_remote(&cloid, oid).await? {
+            return self
+                .state_from_remote(remote, Some(client_order_id))
+                .await
+                .map(Some);
+        }
+        if let Some(saved) = saved {
+            if let Some(oid) = oid.or(saved.oid)
+                && let Some(state) = self.state_from_oid_fills(&saved, oid).await?
+            {
+                return Ok(Some(state));
             }
-            return Ok(None);
-        };
-        self.state_from_remote(remote, Some(client_order_id))
-            .await
-            .map(Some)
+            return Err(error(
+                "reserved order no longer queryable; cannot assume it never filled",
+            ));
+        }
+        Ok(None)
     }
 
     async fn cancel(&self, venue_order_id: &str) -> ArbResult<()> {
@@ -1390,7 +1543,7 @@ impl Journal {
                 "torn intent journal record; manual reconciliation required",
             ));
         }
-        let mut by_cloid = HashMap::new();
+        let mut by_cloid: HashMap<String, Reservation> = HashMap::new();
         for line in text.lines() {
             let item: Reservation =
                 serde_json::from_str(line).map_err(|_| error("invalid intent journal record"))?;
@@ -1402,8 +1555,22 @@ impl Journal {
             {
                 return Err(error("intent journal identity/quantity mismatch"));
             }
-            if by_cloid.insert(item.cloid.clone(), item).is_some() {
-                return Err(error("duplicate reserved ID in intent journal"));
+            if let Some(existing) = by_cloid.get_mut(&item.cloid) {
+                if !same_intent(&existing.order, &item.order)
+                    || existing.effective_quantity != item.effective_quantity
+                    || existing.account != item.account
+                    || existing.signer != item.signer
+                {
+                    return Err(error("duplicate reserved ID in intent journal"));
+                }
+                if let Some(oid) = item.oid {
+                    if existing.oid.is_some_and(|saved| saved != oid) {
+                        return Err(error("venue order ID changed for reserved cloid"));
+                    }
+                    existing.oid = Some(oid);
+                }
+            } else {
+                by_cloid.insert(item.cloid.clone(), item);
             }
         }
         // Persist a newly-created file and its directory before any future reservation.
@@ -1428,6 +1595,28 @@ impl Journal {
             serde_json::to_vec(&item).map_err(|_| error("cannot serialize intent journal"))?;
         bytes.push(b'\n');
         // Poison first, including if a short write or sync failure leaves a partial record.
+        self.poisoned = true;
+        self.by_cloid.insert(item.cloid.clone(), item);
+        self.file.write_all(&bytes)?;
+        self.file.sync_all()?;
+        self.poisoned = false;
+        Ok(())
+    }
+
+    fn remember_oid(&mut self, cloid: &str, oid: u64) -> ArbResult<()> {
+        let Some(mut item) = self.by_cloid.get(cloid).cloned() else {
+            return Err(error("cannot record oid without reservation"));
+        };
+        if let Some(saved) = item.oid {
+            if saved != oid {
+                return Err(error("venue order ID changed for reserved cloid"));
+            }
+            return Ok(());
+        }
+        item.oid = Some(oid);
+        let mut bytes =
+            serde_json::to_vec(&item).map_err(|_| error("cannot serialize intent journal"))?;
+        bytes.push(b'\n');
         self.poisoned = true;
         self.by_cloid.insert(item.cloid.clone(), item);
         self.file.write_all(&bytes)?;
@@ -2104,6 +2293,31 @@ fn ack(state: &OrderState) -> ArbResult<OrderAck> {
     })
 }
 
+fn ack_oid(status: &Value) -> Option<u64> {
+    let parse = |value: Option<&Value>| {
+        value.and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+        })
+    };
+    parse(status.pointer("/filled/oid")).or_else(|| parse(status.pointer("/resting/oid")))
+}
+
+fn match_historical_order<'a>(
+    rows: &'a [RemoteStatus],
+    oid: Option<u64>,
+    cloid: &str,
+) -> Option<&'a RemoteStatus> {
+    if let Some(oid) = oid {
+        if let Some(row) = rows.iter().find(|row| row.order.oid == oid) {
+            return Some(row);
+        }
+    }
+    rows.iter()
+        .find(|row| row.order.cloid.as_deref() == Some(cloid))
+}
+
 fn now_ms() -> ArbResult<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2456,6 +2670,7 @@ mod tests {
             cloid: cloid.clone(),
             order: order.clone(),
             effective_quantity: dec!(1.234),
+            oid: None,
         };
         journal.reserve(reservation.clone()).unwrap();
         assert!(Journal::open(&path, "account", "signer", Venue::Hyperliquid).is_err());
@@ -2469,6 +2684,96 @@ mod tests {
         drop(reopened);
         assert!(Journal::open(&path, "other-account", "signer", Venue::Hyperliquid).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn remembered_oid_survives_restart_and_rejects_a_different_oid() {
+        let path = std::env::temp_dir().join(format!(
+            "arb-hyperliquid-oid-journal-{}-{}.jsonl",
+            std::process::id(),
+            next_nonce().unwrap()
+        ));
+        let order = order();
+        let cloid = client_cloid(&order.client_order_id);
+        let mut journal = Journal::open(&path, "account", "signer", Venue::Hyperliquid).unwrap();
+        journal
+            .reserve(Reservation {
+                account: "account".into(),
+                signer: "signer".into(),
+                cloid: cloid.clone(),
+                order: order.clone(),
+                effective_quantity: dec!(1.234),
+                oid: None,
+            })
+            .unwrap();
+        journal.remember_oid(&cloid, 99).unwrap();
+        journal.remember_oid(&cloid, 99).unwrap();
+        assert_eq!(journal.by_cloid.get(&cloid).unwrap().oid, Some(99));
+        assert!(journal.remember_oid(&cloid, 100).is_err());
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn remote(oid: u64, cloid: &str, orig: &str, remaining: &str, status: &str) -> RemoteStatus {
+        RemoteStatus {
+            order: RemoteOrder {
+                coin: "BTC".into(),
+                side: "A".into(),
+                limit_px: "100".into(),
+                sz: remaining.into(),
+                orig_sz: orig.into(),
+                oid,
+                timestamp: 1,
+                reduce_only: true,
+                cloid: Some(cloid.into()),
+            },
+            status: status.into(),
+            status_timestamp: 2,
+        }
+    }
+
+    #[test]
+    fn ack_oid_reads_filled_or_resting_ids() {
+        assert_eq!(
+            ack_oid(&json!({"filled":{"totalSz":"1","avgPx":"2","oid":77}})),
+            Some(77)
+        );
+        assert_eq!(
+            ack_oid(&json!({"resting":{"oid":"88"}})),
+            Some(88)
+        );
+        assert_eq!(ack_oid(&json!({"error":"nope"})), None);
+    }
+
+    #[test]
+    fn historical_lookup_prefers_oid_and_does_not_infer_a_zero_position() {
+        let rows = vec![
+            remote(1, "0xaaa", "1", "0", "filled"),
+            remote(2, "0xbbb", "1", "1", "canceled"),
+        ];
+        assert_eq!(
+            match_historical_order(&rows, Some(2), "0xaaa")
+                .unwrap()
+                .order
+                .oid,
+            2
+        );
+        assert_eq!(
+            match_historical_order(&rows, None, "0xaaa")
+                .unwrap()
+                .order
+                .oid,
+            1
+        );
+        assert!(match_historical_order(&rows, Some(9), "0xmissing").is_none());
+        assert_eq!(
+            verified_status(OrderStatus::Filled, dec!(2), dec!(1), dec!(1)).unwrap(),
+            OrderStatus::Cancelled
+        );
+        assert_eq!(
+            verified_status(OrderStatus::Filled, dec!(2), Decimal::ZERO, dec!(2)).unwrap(),
+            OrderStatus::Filled
+        );
     }
 
     #[test]
@@ -2682,6 +2987,7 @@ mod tests {
                 cloid: client_cloid(&order.client_order_id),
                 order,
                 effective_quantity: dec!(1.234),
+                oid: None,
             })
             .unwrap();
         drop(journal);

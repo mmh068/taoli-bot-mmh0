@@ -42,6 +42,24 @@ const REJECT_GAP: Duration = Duration::from_secs(15);
 const BUSY_RETRY: Duration = Duration::from_secs(5);
 /// 两次自动开仓之间至少隔这么久。
 pub const MIN_OPEN_GAP: Duration = Duration::from_secs(60);
+
+/// `ARB_RH_AUTO_OPEN_GAP_SEC`：不填或空 = [`MIN_OPEN_GAP`]；0 = 不等待；大于 3600 或不是整数则回落默认。
+fn open_gap_from_env() -> Duration {
+    match std::env::var("ARB_RH_AUTO_OPEN_GAP_SEC") {
+        Ok(raw) if !raw.trim().is_empty() => match raw.trim().parse::<u64>() {
+            Ok(sec) if sec <= 3600 => Duration::from_secs(sec),
+            Ok(sec) => {
+                warn!(sec, "ARB_RH_AUTO_OPEN_GAP_SEC 超过 3600，按 60 秒");
+                MIN_OPEN_GAP
+            }
+            Err(_) => {
+                warn!(raw = %raw.trim(), "ARB_RH_AUTO_OPEN_GAP_SEC 必须是 0 到 3600 的整数，按 60 秒");
+                MIN_OPEN_GAP
+            }
+        },
+        _ => MIN_OPEN_GAP,
+    }
+}
 /// 开仓连续以回滚收场这么多次就关闭自动交易。
 pub const MAX_FAILURES: u32 = 2;
 /// 价差监控的快照超过这么久没更新就不下单。
@@ -375,6 +393,8 @@ pub fn classify(status: StatusCode, body: &Value) -> Outcome {
 pub struct AutoTrader {
     path: Option<PathBuf>,
     inner: Mutex<Inner>,
+    /// 两笔自动开仓之间的最短间隔（`ARB_RH_AUTO_OPEN_GAP_SEC`）。
+    open_gap: Duration,
 }
 
 struct Inner {
@@ -404,8 +424,14 @@ impl AutoTrader {
             }),
             Err(_) => Persisted::default(),
         };
+        let open_gap = open_gap_from_env();
+        info!(
+            open_gap_sec = open_gap.as_secs(),
+            "价差自动开仓间隔（ARB_RH_AUTO_OPEN_GAP_SEC）"
+        );
         Arc::new(Self {
             path: Some(path),
+            open_gap,
             inner: Mutex::new(Inner {
                 persisted,
                 events: VecDeque::new(),
@@ -423,6 +449,7 @@ impl AutoTrader {
     pub fn in_memory(settings: Settings) -> Arc<Self> {
         Arc::new(Self {
             path: None,
+            open_gap: MIN_OPEN_GAP,
             inner: Mutex::new(Inner {
                 persisted: Persisted {
                     settings,
@@ -656,9 +683,12 @@ impl AutoTrader {
             }
             if inner
                 .last_open
-                .is_some_and(|at| at.elapsed() < MIN_OPEN_GAP)
+                .is_some_and(|at| at.elapsed() < self.open_gap)
             {
-                inner.status = "刚开过一笔，间隔 60 秒再看".into();
+                inner.status = format!(
+                    "刚开过一笔，间隔 {} 秒再看",
+                    self.open_gap.as_secs()
+                );
                 return;
             }
             let instant = Instant::now();
@@ -830,7 +860,7 @@ impl AutoTrader {
                 inner.status = "交易台忙（规则轮或手动操作），5 秒后再试".into();
             }
             Outcome::Paused => {
-                inner.retry_at = Some(now + MIN_OPEN_GAP);
+                inner.retry_at = Some(now + self.open_gap);
                 Self::push(&mut inner, "paused", base, format!("没下单：{reason}"));
                 inner.status = format!("没下单：{reason}");
             }

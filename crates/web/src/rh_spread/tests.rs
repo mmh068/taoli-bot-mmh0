@@ -825,6 +825,9 @@ fn a_pair_with_two_snapshot_feeds_goes_stale_on_the_older_book() {
 struct Recorder(std::sync::Mutex<Vec<String>>);
 
 impl crate::alert::Sink for Recorder {
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
     fn send(
         &self,
         text: String,
@@ -879,4 +882,63 @@ async fn alerts_need_a_held_signal_and_never_exceed_their_own_rate_limit() {
         ALERTS_PER_MINUTE,
         "价差提醒每分钟不超过自己的上限"
     );
+}
+
+fn signal_line() -> Line {
+    let now = Instant::now();
+    let arcus = book(
+        &[(dec!(99.98), dec!(100))],
+        &[(dec!(100.00), dec!(100))],
+        now,
+    );
+    let lighter = book(
+        &[(dec!(100.20), dec!(100))],
+        &[(dec!(100.22), dec!(100))],
+        now,
+    );
+    let mut line = evaluate(
+        Pair::RH,
+        &market("INDICES"),
+        Some(&arcus),
+        Some(&lighter),
+        Some(normal(-0.05)),
+        500,
+        Session::Off,
+        &config(),
+        now,
+    );
+    line.best.as_mut().unwrap().signal_sec = SIGNAL_HOLD.as_secs();
+    line
+}
+
+#[tokio::test]
+async fn spread_alerts_skip_coins_already_held() {
+    let sink = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+    let alerter =
+        crate::alert::Alerter::with_sink(Some(sink.clone() as Arc<dyn crate::alert::Sink>));
+    let held = HeldBases::default();
+    held.replace(["openai", "SPY"]);
+    let monitor = Monitor::with_held(config(), alerter, held);
+    let mut line = signal_line();
+    line.base = "OPENAI".into();
+    monitor.maybe_alert(&line);
+    line.base = "QQQ".into();
+    monitor.maybe_alert(&line);
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    let sent = sink.0.lock().unwrap();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].contains("QQQ"), "{sent:?}");
+    assert!(!sent[0].contains("OPENAI"), "{sent:?}");
+}
+
+#[test]
+fn held_bases_match_the_coin_name_not_the_quote() {
+    let held = HeldBases::default();
+    held.replace(["OPENAI"]);
+    assert!(held.contains("openai"));
+    assert!(held.contains(" OPENAI "));
+    assert!(!held.contains("QQQ"));
+    assert!(!held.contains(""));
 }
